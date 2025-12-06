@@ -1,0 +1,343 @@
+[
+    {
+        "id": "cb6bfda69aa2be71",
+        "type": "tab",
+        "label": "Smart Lock Split Topics",
+        "disabled": false,
+        "info": ""
+    },
+    {
+        "id": "8f6751f3c3b335c3",
+        "type": "mqtt in",
+        "z": "cb6bfda69aa2be71",
+        "name": "Topic: Status (String)",
+        "topic": "esp32/lock/status",
+        "qos": "0",
+        "datatype": "utf8",
+        "broker": "mqtt_hivemq",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 140,
+        "y": 100,
+        "wires": [
+            [
+                "5075fbdef21a3868"
+            ]
+        ]
+    },
+    {
+        "id": "465e4c9ce8fcf9cd",
+        "type": "mqtt in",
+        "z": "cb6bfda69aa2be71",
+        "name": "Log JSON",
+        "topic": "esp32/lock/log",
+        "qos": "0",
+        "datatype": "json",
+        "broker": "mqtt_hivemq",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 100,
+        "y": 240,
+        "wires": [
+            [
+                "e0765499c2a81bd2",
+                "5382859a9324efa3"
+            ]
+        ]
+    },
+    {
+        "id": "3e1b5cc9280e814e",
+        "type": "ui_text",
+        "z": "cb6bfda69aa2be71",
+        "group": "group_status",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "name": "Current Status",
+        "label": "Door Status:",
+        "format": "{{msg.payload}}",
+        "layout": "row-spread",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": "",
+        "color": "#000000",
+        "x": 620,
+        "y": 100,
+        "wires": []
+    },
+    {
+        "id": "5075fbdef21a3868",
+        "type": "function",
+        "z": "cb6bfda69aa2be71",
+        "name": "Set Color (String)",
+        "func": "// Input is now just a string: \"LOCKED\" or \"UNLOCKED\"\n\nif (msg.payload == \"UNLOCKED\") {\n    msg.color = \"green\";\n} else {\n    msg.color = \"red\";\n}\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 410,
+        "y": 100,
+        "wires": [
+            [
+                "3e1b5cc9280e814e"
+            ]
+        ]
+    },
+    {
+        "id": "7132902b153fb0bc",
+        "type": "http request",
+        "z": "cb6bfda69aa2be71",
+        "name": "Save to DB (POST)",
+        "method": "POST",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "https://bfjbmjb2-5000.asse.devtunnels.ms/log/",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 630,
+        "y": 200,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "e0765499c2a81bd2",
+        "type": "function",
+        "z": "cb6bfda69aa2be71",
+        "name": "Format for Schema",
+        "func": "// Input comes from esp32/lock/payload\n// Expected: { \"userId\": \"LEC_A\", \"room\": \"ROOM_404\" }\n\nmsg.payload = {\n    \"userId\": msg.payload.userId,\n    \"room\": msg.payload.room,\n    \"timestamp\": new Date().toISOString()\n};\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 410,
+        "y": 200,
+        "wires": [
+            [
+                "7132902b153fb0bc"
+            ]
+        ]
+    },
+    {
+        "id": "5382859a9324efa3",
+        "type": "function",
+        "z": "cb6bfda69aa2be71",
+        "name": "Merge Schema Data",
+        "func": "var logData = context.get('logData') || [];\n\n// --- PATH A: FROM DATABASE (History) ---\nif (msg.responseUrl) {\n    if (msg.payload && Array.isArray(msg.payload.data)) {\n        logData = msg.payload.data.map(function (item) {\n            var formattedTime = new Date(item.timestamp).toLocaleString();\n            return {\n                time: formattedTime,\n                user: item.userId,\n                room: item.room\n            };\n        });\n    }\n}\n\n// --- PATH B: FROM MQTT (Live JSON) ---\nelse {\n    // Incoming from esp32/lock/payload\n    var newRow = {\n        time: new Date().toLocaleString(),\n        // Direct access to userId because the input is the raw MQTT JSON\n        user: msg.payload.userId || \"Unknown\",\n        room: msg.payload.room || \"Unknown\"\n    };\n\n    logData.unshift(newRow);\n}\n\n// Limit table\nif (logData.length > 50) logData = logData.slice(0, 50);\n\ncontext.set('logData', logData);\nmsg.payload = logData;\nreturn msg;",
+        "outputs": 1,
+        "timeout": "",
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 630,
+        "y": 320,
+        "wires": [
+            [
+                "70d899778c216b23"
+            ]
+        ]
+    },
+    {
+        "id": "01a11647464e527d",
+        "type": "http request",
+        "z": "cb6bfda69aa2be71",
+        "name": "Get DB History",
+        "method": "GET",
+        "ret": "obj",
+        "paytoqs": "ignore",
+        "url": "https://bfjbmjb2-5000.asse.devtunnels.ms/log/",
+        "tls": "",
+        "persist": false,
+        "proxy": "",
+        "insecureHTTPParser": false,
+        "authType": "",
+        "senderr": false,
+        "headers": [],
+        "x": 420,
+        "y": 400,
+        "wires": [
+            [
+                "5382859a9324efa3"
+            ]
+        ]
+    },
+    {
+        "id": "dc151042bd00f68b",
+        "type": "ui_ui_control",
+        "z": "cb6bfda69aa2be71",
+        "name": "On Load",
+        "events": "connect",
+        "x": 140,
+        "y": 400,
+        "wires": [
+            [
+                "01a11647464e527d"
+            ]
+        ]
+    },
+    {
+        "id": "70d899778c216b23",
+        "type": "ui_table",
+        "z": "cb6bfda69aa2be71",
+        "group": "group_logs",
+        "name": "Access Logs",
+        "order": 0,
+        "width": "12",
+        "height": "8",
+        "columns": [
+            {
+                "field": "time",
+                "title": "Time",
+                "width": "8",
+                "align": "left",
+                "formatter": "plaintext",
+                "formatterParams": {
+                    "target": "_blank"
+                }
+            },
+            {
+                "field": "user",
+                "title": "User",
+                "width": "8",
+                "align": "left",
+                "formatter": "plaintext",
+                "formatterParams": {
+                    "target": "_blank"
+                }
+            },
+            {
+                "field": "room",
+                "title": "Room",
+                "width": "8",
+                "align": "left",
+                "formatter": "plaintext",
+                "formatterParams": {
+                    "target": "_blank"
+                }
+            }
+        ],
+        "outputs": 0,
+        "cts": false,
+        "x": 850,
+        "y": 320,
+        "wires": []
+    },
+    {
+        "id": "inject_sleep_cmd",
+        "type": "inject",
+        "z": "cb6bfda69aa2be71",
+        "name": "Trigger Sleep (7 PM)",
+        "props": [
+            {
+                "p": "payload"
+            }
+        ],
+        "repeat": "",
+        "crontab": "",
+        "once": false,
+        "onceDelay": 0.1,
+        "topic": "",
+        "payload": "SLEEP",
+        "payloadType": "str",
+        "x": 210,
+        "y": 540,
+        "wires": [
+            [
+                "mqtt_sleep_out_node"
+            ]
+        ]
+    },
+    {
+        "id": "mqtt_sleep_out_node",
+        "type": "mqtt out",
+        "z": "cb6bfda69aa2be71",
+        "name": "To Sleep Topic",
+        "topic": "esp32/lock/sleep",
+        "qos": "1",
+        "retain": "true",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "mqtt_hivemq",
+        "x": 500,
+        "y": 540,
+        "wires": []
+    },
+    {
+        "id": "mqtt_hivemq",
+        "type": "mqtt-broker",
+        "name": "HiveMQ Public",
+        "broker": "broker.hivemq.com",
+        "port": "1883",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "closeTopic": "",
+        "closeQos": "0",
+        "closePayload": "",
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": ""
+    },
+    {
+        "id": "group_status",
+        "type": "ui_group",
+        "name": "Live Status",
+        "tab": "tab_smart_lock",
+        "order": 1,
+        "disp": true,
+        "width": "6",
+        "collapse": false
+    },
+    {
+        "id": "group_logs",
+        "type": "ui_group",
+        "name": "Access Logs",
+        "tab": "tab_smart_lock",
+        "order": 2,
+        "disp": true,
+        "width": "12",
+        "collapse": false
+    },
+    {
+        "id": "tab_smart_lock",
+        "type": "ui_tab",
+        "name": "Smart Lock Dashboard",
+        "icon": "dashboard",
+        "order": 1,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "6bed60a0c7fdfe0a",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-dashboard": "3.6.6",
+            "node-red-node-ui-table": "0.4.5"
+        }
+    }
+]

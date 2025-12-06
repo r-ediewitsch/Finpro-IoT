@@ -25,6 +25,7 @@
 #define MQTT_PORT           1883
 #define MQTT_TOPIC_STATUS   "esp32/lock/status" // Topic 1: Real-time Status
 #define MQTT_TOPIC_LOG      "esp32/lock/log"    // Topic 2: Database Log (JSON)
+#define MQTT_TOPIC_SLEEP    "esp32/lock/sleep"  // Topic 3: Sleep Command (NEW)
 
 // --- HARDWARE SETTINGS ---
 #define LOCK_PIN            16  
@@ -63,6 +64,9 @@ int currentUserIndex = -1;
 
 // Tracks who performed the action (for Logging)
 String lastUnlockedBy = "SYSTEM"; 
+
+// --- NEW: Debounce Timer Variable ---
+unsigned long lastBleUnlockTime = 0; 
 
 QueueHandle_t doorQueue;
 TimerHandle_t autoLockTimer; 
@@ -186,7 +190,6 @@ void loadOfflineDatabase() {
 void publishLiveStatus(String state) {
     if (!client.connected()) return;
     client.publish(MQTT_TOPIC_STATUS, state.c_str());
-    // (Optional: add MQTT log here if you want, but sticking to your requested logs)
 }
 
 // 2. Sends Full JSON (For Database/Logs)
@@ -251,7 +254,6 @@ void doorTask(void * parameter) {
         
         // MQTT ACTIONS
         publishLiveStatus("LOCKED");
-        // No log needed for auto-lock usually
       }
     }
     
@@ -290,10 +292,20 @@ class IDCallbacks: public BLECharacteristicCallbacks {
         rxValue.trim();
 
         if (rxValue.length() > 0) {
-            Serial.print("[BLE] ID Rx: "); Serial.println(rxValue);
             int cmd = 1; 
 
             if (rxValue == "OPEN") {
+                // --- NEW: DEBOUNCE LOGIC ---
+                // We check if it has been at least 2000ms (2 seconds) since the last unlock
+                unsigned long now = millis();
+                if (now - lastBleUnlockTime < 2000) {
+                    Serial.println("[BLE] OPEN command ignored (spam protection)");
+                    return; // Stop here, do not process
+                }
+
+                Serial.print("[BLE] ID Rx: "); Serial.println(rxValue);
+                lastBleUnlockTime = now; // Update the timestamp
+
                 if (idVerified && currentUserIndex != -1) {
                     User u = userDatabase[currentUserIndex];
                     
@@ -318,7 +330,8 @@ class IDCallbacks: public BLECharacteristicCallbacks {
                 }
             }
             else {
-                // Identity Lookup
+                // Identity Lookup (We don't debounce this as finding ID is fast and passive)
+                Serial.print("[BLE] ID Rx: "); Serial.println(rxValue);
                 bool found = false;
                 for(int i=0; i < userDatabase.size(); i++) {
                     if (userDatabase[i].id == rxValue) {
@@ -368,14 +381,37 @@ class NonceCallbacks: public BLECharacteristicCallbacks {
 // 8. SETUP & LOOP
 // ==========================================
 
+// --- MQTT CALLBACK FUNCTION ---
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.print("MQTT Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  Serial.println(message);
+
+  if (String(topic) == MQTT_TOPIC_SLEEP && message == "SLEEP") {
+      Serial.println("[SYSTEM] Sleep command received.");
+      
+      client.publish(MQTT_TOPIC_SLEEP, "SLEEPING_NOW", true); 
+      delay(500); 
+
+      Serial.println("[SYSTEM] Entering Deep Sleep for 12 Hours...");
+      esp_sleep_enable_timer_wakeup(12ULL * 60 * 60 * 1000000);
+      esp_deep_sleep_start();
+  }
+}
+
 void reconnectMQTT() {
   while (!client.connected()) {
-    // Silent background reconnection to avoid spamming logs
     String clientId = "ESP32Client-";
     clientId += String(random(0xffff), HEX);
     if (client.connect(clientId.c_str())) {
       Serial.println("[MQTT] Connected");
-      
+      client.subscribe(MQTT_TOPIC_SLEEP);
       String currentStatus = (digitalRead(LOCK_PIN) == HIGH) ? "UNLOCKED" : "LOCKED";
       publishLiveStatus(currentStatus);
     } else {
@@ -418,6 +454,7 @@ void setup() {
 
   // MQTT INIT
   client.setServer(MQTT_BROKER, MQTT_PORT);
+  client.setCallback(mqttCallback);
 
   // RTOS Setup
   doorQueue = xQueueCreate(10, sizeof(int));
