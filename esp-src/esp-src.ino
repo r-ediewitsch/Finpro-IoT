@@ -14,17 +14,25 @@
 #include <ArduinoJson.h> 
 #include <Preferences.h>
 #include <vector>
+#include <PubSubClient.h> // MQTT Library
 #include "secrets.h" 
 
 // ==========================================
 // 1. CONFIGURATION
 // ==========================================
+// --- MQTT SETTINGS ---
+#define MQTT_BROKER         "broker.hivemq.com" 
+#define MQTT_PORT           1883
+#define MQTT_TOPIC_STATUS   "esp32/lock/status" // Topic 1: Real-time Status
+#define MQTT_TOPIC_LOG      "esp32/lock/log"    // Topic 2: Database Log (JSON)
+
+// --- HARDWARE SETTINGS ---
 #define LOCK_PIN            16  
 #define PIR_PIN             17  
 #define STATUS_LED          2   
 #define AUTO_LOCK_TIMEOUT_MS 15000 
 
-// BLE
+// --- BLE SETTINGS ---
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHAR_ID_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8" 
 #define CHAR_NONCE_UUID     "d29a73d5-1234-4567-8901-23456789abcd" 
@@ -53,9 +61,16 @@ bool deviceConnected = false;
 bool idVerified = false;
 int currentUserIndex = -1;
 
+// Tracks who performed the action (for Logging)
+String lastUnlockedBy = "SYSTEM"; 
+
 QueueHandle_t doorQueue;
 TimerHandle_t autoLockTimer; 
 Preferences preferences; 
+
+// MQTT Client
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 // ==========================================
 // 4. HELPER FUNCTIONS 
@@ -165,6 +180,30 @@ void loadOfflineDatabase() {
     }
 }
 
+// --- MQTT HELPER FUNCTIONS ---
+
+// 1. Sends "LOCKED" or "UNLOCKED" (For UI Status)
+void publishLiveStatus(String state) {
+    if (!client.connected()) return;
+    client.publish(MQTT_TOPIC_STATUS, state.c_str());
+    // (Optional: add MQTT log here if you want, but sticking to your requested logs)
+}
+
+// 2. Sends Full JSON (For Database/Logs)
+void publishAccessLog(String user, String room) {
+    if (!client.connected()) return;
+    
+    JsonDocument doc;
+    doc["userId"] = user;
+    doc["room"]   = room;
+    // Node-RED will add timestamp
+    
+    char buffer[200];
+    serializeJson(doc, buffer);
+
+    client.publish(MQTT_TOPIC_LOG, buffer);
+}
+
 // ==========================================
 // 6. TASKS & TIMERS
 // ==========================================
@@ -185,6 +224,7 @@ void doorTask(void * parameter) {
   for(;;) { 
     if (xQueueReceive(doorQueue, &receivedCommand, pdMS_TO_TICKS(100)) == pdTRUE) {
       if (receivedCommand == 1) { 
+        // --- UNLOCK EVENT ---
         Serial.println("[DOOR] Unlocking...");
         digitalWrite(LOCK_PIN, HIGH);
         digitalWrite(STATUS_LED, HIGH);
@@ -193,8 +233,13 @@ void doorTask(void * parameter) {
         if (deviceConnected && pResponseChar != NULL) {
             pResponseChar->notify();
         }
+        
+        // MQTT ACTIONS
+        publishLiveStatus("UNLOCKED");
+        publishAccessLog(lastUnlockedBy, THIS_ROOM);
       }
       else if (receivedCommand == 0) { 
+        // --- LOCK EVENT ---
         Serial.println("[DOOR] Locking...");
         digitalWrite(LOCK_PIN, LOW);
         digitalWrite(STATUS_LED, LOW);
@@ -203,6 +248,10 @@ void doorTask(void * parameter) {
         if (deviceConnected && pResponseChar != NULL) {
             pResponseChar->notify();
         }
+        
+        // MQTT ACTIONS
+        publishLiveStatus("LOCKED");
+        // No log needed for auto-lock usually
       }
     }
     
@@ -229,6 +278,7 @@ class ServerCallbacks: public BLEServerCallbacks {
       deviceConnected = false;
       idVerified = false;
       currentUserIndex = -1;
+      lastUnlockedBy = "SYSTEM"; // Reset
       Serial.println("[BLE] Device Disconnected. Restarting Advertising...");
       BLEDevice::startAdvertising(); 
     }
@@ -246,6 +296,10 @@ class IDCallbacks: public BLECharacteristicCallbacks {
             if (rxValue == "OPEN") {
                 if (idVerified && currentUserIndex != -1) {
                     User u = userDatabase[currentUserIndex];
+                    
+                    // SAVE USER FOR LOGGING
+                    lastUnlockedBy = u.id;
+
                     if (u.role == "ADMIN") {
                         Serial.println("[ACCESS] Granted (Admin)");
                         xQueueSend(doorQueue, &cmd, 0); 
@@ -313,6 +367,23 @@ class NonceCallbacks: public BLECharacteristicCallbacks {
 // ==========================================
 // 8. SETUP & LOOP
 // ==========================================
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    // Silent background reconnection to avoid spamming logs
+    String clientId = "ESP32Client-";
+    clientId += String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
+      Serial.println("[MQTT] Connected");
+      
+      String currentStatus = (digitalRead(LOCK_PIN) == HIGH) ? "UNLOCKED" : "LOCKED";
+      publishLiveStatus(currentStatus);
+    } else {
+      delay(2000);
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n--- ESP32 SMART LOCK STARTING ---");
@@ -345,6 +416,9 @@ void setup() {
       delay(1000);
   }
 
+  // MQTT INIT
+  client.setServer(MQTT_BROKER, MQTT_PORT);
+
   // RTOS Setup
   doorQueue = xQueueCreate(10, sizeof(int));
   autoLockTimer = xTimerCreate("AutoLock", pdMS_TO_TICKS(AUTO_LOCK_TIMEOUT_MS), pdFALSE, (void*)0, autoLockCallback);
@@ -376,5 +450,11 @@ void setup() {
 }
 
 void loop() {
-  vTaskDelay(2000 / portTICK_PERIOD_MS);
+  if (WiFi.status() == WL_CONNECTED) {
+      if (!client.connected()) {
+          reconnectMQTT();
+      }
+      client.loop();
+  }
+  vTaskDelay(100 / portTICK_PERIOD_MS);
 }
