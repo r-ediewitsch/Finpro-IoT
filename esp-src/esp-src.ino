@@ -1,6 +1,8 @@
 #include <BLEDevice.h>
-#include <BLEUtils.h>
 #include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include "mbedtls/md.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -11,105 +13,175 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// --- CONFIGURATION ---
-#define LOCK_PIN 16 
-#define PIR_PIN  17 
+// ==========================================
+// 1. HARDWARE CONFIGURATION
+// ==========================================
+#define LOCK_PIN            16  // From OLED Code
+#define PIR_PIN             17  // From OLED Code
+#define STATUS_LED          2   // Built-in LED
 #define AUTO_LOCK_TIMEOUT_MS 15000 
 
-// OLED Configuration
+// OLED Settings
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1 
-#define SCREEN_ADDRESS 0x3C // Check Serial Monitor if this is wrong
-#define I2C_SDA 21          // Explicitly define SDA pin
-#define I2C_SCL 22          // Explicitly define SCL pin
+#define SCREEN_ADDRESS 0x3C 
+#define I2C_SDA 21          
+#define I2C_SCL 22          
 
-// UUIDs
+// ==========================================
+// 2. BLE CONFIGURATION
+// ==========================================
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHAR_ID_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8" 
+#define CHAR_NONCE_UUID     "d29a73d5-1234-4567-8901-23456789abcd" 
+#define CHAR_RESPONSE_UUID  "1c95d5e3-d8bc-4e31-9989-13e6184a44b9" 
 
-// --- GLOBALS ---
+// Identity of THIS Lock
+const char* THIS_ROOM = "ROOM_404"; 
+
+// ==========================================
+// 3. USER DATABASE
+// ==========================================
+struct User {
+    String id;
+    String key;
+    String role;        
+    String allowedRoom; 
+};
+
+User userDatabase[] = {
+    // ID          Key            Role        Allowed Room
+    {"ADM_001",    "masterkey",   "ADMIN",    "ALL"},      
+    {"LEC_A",      "mathpass",    "LECTURER", "ROOM_303"}, 
+    {"LEC_B",      "englishpass", "LECTURER", "ROOM_404"}  
+};
+int userCount = sizeof(userDatabase) / sizeof(userDatabase[0]);
+
+// ==========================================
+// 4. GLOBAL OBJECTS
+// ==========================================
+// BLE Globals
 BLEServer* pServer = NULL;
-BLECharacteristic* pCharacteristic = NULL;
+BLECharacteristic* pResponseChar = NULL; // Used for Hash AND Status updates
 bool deviceConnected = false;
+bool idVerified = false;
+int currentUserIndex = -1;
+
+// OLED & RTOS Globals
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 QueueHandle_t doorQueue;
 TimerHandle_t autoLockTimer; 
 
-// Create Display Object
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// ==========================================
+// 5. HELPER FUNCTIONS (Logic & Display)
+// ==========================================
 
-// --- HELPER: UPDATE SCREEN ---
 void updateDisplay(String status) {
   display.clearDisplay();
   
-  // Draw Fixed Room Name "S202"
+  // Room Name
   display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(40, 10); // Roughly centered X=40, Y=10
-  display.println("S202");
+  display.setCursor(20, 10); 
+  display.println(THIS_ROOM);
 
-  // Draw Status (LOCKED / UNLOCKED)
+  // Status
   display.setTextSize(2);
-  display.setCursor(10, 40); // X=10, Y=40
+  display.setCursor(10, 40); 
   display.println(status);
-
   display.display(); 
 }
 
-// --- TIMER CALLBACK ---
+// Convert bytes to Hex String
+String toHexString(uint8_t* data, size_t len) {
+    String output = "";
+    char buff[3];
+    for (size_t i = 0; i < len; i++) {
+        sprintf(buff, "%02x", data[i]);
+        output += buff;
+    }
+    return output;
+}
+
+// Calculate HMAC-SHA256
+void calculateHMAC(String nonce, String key, uint8_t* output) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 1);
+    mbedtls_md_hmac_starts(&ctx, (const unsigned char*)key.c_str(), key.length());
+    mbedtls_md_hmac_update(&ctx, (const unsigned char*)nonce.c_str(), nonce.length());
+    mbedtls_md_hmac_finish(&ctx, output);
+    mbedtls_md_free(&ctx);
+}
+
+// TRIGGER FUNCTION: Sends command to the Task (Non-blocking)
+void triggerDoorUnlock() {
+    int cmd = 1; // 1 = OPEN
+    xQueueSend(doorQueue, &cmd, 0);
+}
+
+// ==========================================
+// 6. TASKS & TIMERS (The "Muscle")
+// ==========================================
+
+// Timer Callback: Runs when 15 seconds passes
 void autoLockCallback(TimerHandle_t xTimer) {
-  Serial.println("TIMER EXPIRED");
+  Serial.println("TIMER EXPIRED: Auto-locking...");
   int closeCommand = 0; 
   xQueueSend(doorQueue, &closeCommand, 0); 
 }
 
-// --- DOOR TASK ---
+// Main Door Task: Handles OLED, Relay, and PIR
 void doorTask(void * parameter) {
   int receivedCommand;
   bool isUnlocked = false; 
   unsigned long lastTimerReset = 0; 
 
-  // Initial Screen
-  updateDisplay("LOCKED");
+  updateDisplay("LOCKED"); // Initial State
 
   for(;;) { 
+    // Wait for command from BLE or Timer
     if (xQueueReceive(doorQueue, &receivedCommand, pdMS_TO_TICKS(100)) == pdTRUE) {
       
-      if (receivedCommand == 1) { // OPEN
-        Serial.println("CMD: OPEN");
+      // --- COMMAND: OPEN ---
+      if (receivedCommand == 1) { 
+        Serial.println("TASK: Unlocking Hardware");
         digitalWrite(LOCK_PIN, HIGH);
+        digitalWrite(STATUS_LED, HIGH);
         isUnlocked = true;
-        xTimerStart(autoLockTimer, 0);
-        
-        // UPDATE OLED: Show UNLOCKED
+        xTimerStart(autoLockTimer, 0); // Start Auto-lock
         updateDisplay("UNLOCKED");
-
-        if (deviceConnected) {
-           pCharacteristic->setValue("Unlocked");
-           pCharacteristic->notify();
+        
+        // Notify App if connected
+        if (deviceConnected && pResponseChar != NULL) {
+            pResponseChar->setValue("UNLOCKED");
+            pResponseChar->notify();
         }
       }
-      else if (receivedCommand == 0) { // CLOSE
-        Serial.println("CMD: CLOSE");
+      // --- COMMAND: CLOSE ---
+      else if (receivedCommand == 0) { 
+        Serial.println("TASK: Locking Hardware");
         digitalWrite(LOCK_PIN, LOW);
+        digitalWrite(STATUS_LED, LOW);
         isUnlocked = false;
         xTimerStop(autoLockTimer, 0);
-        
-        // UPDATE OLED: Show LOCKED
         updateDisplay("LOCKED");
-
-        if (deviceConnected) {
-           pCharacteristic->setValue("Locked");
-           pCharacteristic->notify();
+        
+        // Notify App if connected
+        if (deviceConnected && pResponseChar != NULL) {
+            pResponseChar->setValue("LOCKED");
+            pResponseChar->notify();
         }
       }
     }
 
-    // CHECK PIR
-    // Note: We extend the timer logic here but do NOT update the display text
+    // --- PIR MOTION EXTENSION ---
+    // If door is unlocked AND motion detected -> Reset Timer
     if (isUnlocked && digitalRead(PIR_PIN) == HIGH) {
       if (millis() - lastTimerReset > 1000) {
-        Serial.println("Motion: Timer Reset");
+        Serial.println("Motion Detected: Extending Unlock Timer");
         xTimerReset(autoLockTimer, 0); 
         lastTimerReset = millis();
       }
@@ -117,94 +189,168 @@ void doorTask(void * parameter) {
   }
 }
 
-// --- CALLBACKS ---
-class MyServerCallbacks: public BLEServerCallbacks {
+// ==========================================
+// 7. BLE CALLBACKS (The "Brain")
+// ==========================================
+
+class ServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
       Serial.println("Device Connected");
     };
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
+      idVerified = false;
+      currentUserIndex = -1;
       Serial.println("Device Disconnected");
       BLEDevice::startAdvertising(); 
     }
 };
 
-class MyCallbacks: public BLECharacteristicCallbacks {
+class IDCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-      String value = pCharacteristic->getValue();
-      if (value.length() > 0) {
-        int commandToSend = -1;
-        if (value == "open" || value == "1") commandToSend = 1;
-        else if (value == "close" || value == "0") commandToSend = 0;
+        String rxValue = pCharacteristic->getValue().c_str();
 
-        if (commandToSend != -1) {
-           xQueueSend(doorQueue, &commandToSend, 0); 
+        // CLEANUP
+        while (rxValue.length() > 0 && 
+              (rxValue[rxValue.length()-1] == 0 || 
+               rxValue[rxValue.length()-1] == '\n' || 
+               rxValue[rxValue.length()-1] == '\r' ||
+               rxValue[rxValue.length()-1] == ' ')) {
+            rxValue.remove(rxValue.length()-1);
         }
-      }
+
+        if (rxValue.length() > 0) {
+            Serial.print("Rx ID: ["); Serial.print(rxValue); Serial.println("]");
+
+            // --- COMMAND: OPEN ---
+            if (rxValue == "OPEN") {
+                if (idVerified && currentUserIndex != -1) {
+                    String role = userDatabase[currentUserIndex].role;
+                    String targetRoom = userDatabase[currentUserIndex].allowedRoom;
+                    
+                    if (role == "ADMIN") {
+                        Serial.println("Access: GRANTED (Admin)");
+                        triggerDoorUnlock(); // Calls the Queue/Task
+                    } 
+                    else if (role == "LECTURER" && targetRoom == THIS_ROOM) {
+                        Serial.println("Access: GRANTED (Lecturer)");
+                        triggerDoorUnlock(); // Calls the Queue/Task
+                    } 
+                    else {
+                         Serial.println("Access: DENIED (Wrong Room)");
+                         // Notify App of specific failure
+                         pResponseChar->setValue("DENIED_ROOM");
+                         pResponseChar->notify();
+                    }
+                } else {
+                    Serial.println("Error: Not Authenticated.");
+                }
+            }
+            // --- IDENTIFICATION: USER ID ---
+            else {
+                bool found = false;
+                for(int i=0; i < userCount; i++) {
+                    if (userDatabase[i].id == rxValue) {
+                        currentUserIndex = i;
+                        idVerified = true;
+                        found = true;
+                        Serial.print("User Identified: "); Serial.println(userDatabase[i].id);
+                        break;
+                    }
+                }
+                if(!found) {
+                    idVerified = false;
+                    currentUserIndex = -1;
+                    Serial.println("Unknown User ID.");
+                }
+            }
+        }
     }
 };
 
+class NonceCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        String nonce = pCharacteristic->getValue().c_str();
+
+        // CLEANUP
+        while (nonce.length() > 0 && 
+              (nonce[nonce.length()-1] == 0 || 
+               nonce[nonce.length()-1] == '\n' || 
+               nonce[nonce.length()-1] == '\r' ||
+               nonce[nonce.length()-1] == ' ')) {
+            nonce.remove(nonce.length()-1);
+        }
+
+        if (nonce.length() > 0) {
+            Serial.print("Nonce: "); Serial.println(nonce);
+
+            if(idVerified && currentUserIndex != -1) {
+                String userKey = userDatabase[currentUserIndex].key;
+                uint8_t hmacResult[32];
+                calculateHMAC(nonce, userKey, hmacResult);
+                String hexSignature = toHexString(hmacResult, 32);
+                
+                // Send Hash
+                pResponseChar->setValue(hexSignature.c_str());
+                pResponseChar->notify();
+                Serial.print("Sent Hash: "); Serial.println(hexSignature);
+            } else {
+                Serial.println("Ignored Nonce: User not verified.");
+            }
+        }
+    }
+};
+
+// ==========================================
+// 8. SETUP & LOOP
+// ==========================================
 void setup() {
   Serial.begin(115200);
   
+  // --- GPIO SETUP ---
   pinMode(LOCK_PIN, OUTPUT);
-  digitalWrite(LOCK_PIN, LOW); 
-  pinMode(PIR_PIN, INPUT); 
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(PIR_PIN, INPUT);
+  digitalWrite(LOCK_PIN, LOW); // Locked on boot
+  digitalWrite(STATUS_LED, LOW);
 
-  // --- I2C INITIALIZATION & DIAGNOSTICS ---
-  // 1. Explicitly initialize Wire with the correct pins
+  // --- I2C / OLED SETUP ---
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(100000); // FIX: Lower I2C clock to 100kHz for stability
-  delay(100); // Give display time to power up
+  Wire.setClock(100000); 
+  delay(100);
 
-  // 2. Run a quick scan to confirm the screen is connected
-  Serial.println("Scanning for I2C devices...");
-  byte error, address;
-  int nDevices = 0;
-  for(address = 1; address < 127; address++ ) {
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      Serial.print("I2C device found at address 0x");
-      if (address<16) Serial.print("0");
-      Serial.print(address,HEX);
-      Serial.println("  !");
-      nDevices++;
-    }
-  }
-  if (nDevices == 0) {
-    Serial.println("No I2C devices found. CHECK WIRING (SDA=21, SCL=22)!");
-  } else {
-    Serial.println("I2C Scan complete.");
-  }
-  // ----------------------------------------
-
-  // --- OLED SETUP ---
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println(F("SSD1306 allocation failed. Check Address/Wiring."));
+    Serial.println(F("SSD1306 allocation failed. Check wiring."));
     for(;;); 
   }
   display.clearDisplay();
   display.display();
 
+  // --- RTOS SETUP ---
   doorQueue = xQueueCreate(10, sizeof(int));
   autoLockTimer = xTimerCreate("AutoLock", pdMS_TO_TICKS(AUTO_LOCK_TIMEOUT_MS), pdFALSE, (void*)0, autoLockCallback);
-
+  // Start the Door Task on Core 1
   xTaskCreatePinnedToCore(doorTask, "DoorTask", 4096, NULL, 1, NULL, 1);
 
-  BLEDevice::init("ESP32_Classroom");
+  // --- BLE SETUP ---
+  BLEDevice::init("ESP32_Smart_Lock"); // Combined Name
   pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
+  pServer->setCallbacks(new ServerCallbacks());
   BLEService *pService = pServer->createService(SERVICE_UUID);
-  pCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ |
-                      BLECharacteristic::PROPERTY_WRITE |
-                      BLECharacteristic::PROPERTY_NOTIFY
-                    );
-  pCharacteristic->setCallbacks(new MyCallbacks());
-  pCharacteristic->setValue("Locked");
+
+  // ID Characteristic
+  BLECharacteristic *pIDChar = pService->createCharacteristic(CHAR_ID_UUID, BLECharacteristic::PROPERTY_WRITE);
+  pIDChar->setCallbacks(new IDCallbacks());
+
+  // Nonce Characteristic
+  BLECharacteristic *pNonceChar = pService->createCharacteristic(CHAR_NONCE_UUID, BLECharacteristic::PROPERTY_WRITE);
+  pNonceChar->setCallbacks(new NonceCallbacks());
+
+  // Response Characteristic
+  pResponseChar = pService->createCharacteristic(CHAR_RESPONSE_UUID, BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
+  pResponseChar->addDescriptor(new BLE2902());
+
   pService->start();
   
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -213,9 +359,10 @@ void setup() {
   pAdvertising->setMinPreferred(0x06);  
   BLEDevice::startAdvertising();
   
-  Serial.println("System Running...");
+  Serial.println("System Running: Secure OLED Lock");
 }
 
 void loop() {
+  // Main loop is empty because FreeRTOS Task handles the door
   vTaskDelay(2000 / portTICK_PERIOD_MS);
 }
