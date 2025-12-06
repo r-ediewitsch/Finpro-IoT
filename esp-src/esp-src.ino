@@ -8,40 +8,32 @@
 #include "freertos/queue.h"
 #include "freertos/timers.h"
 
-// --- OLED LIBRARIES ---
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+// --- NETWORK & STORAGE ---
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h> 
+#include <Preferences.h>
+#include <vector>
+#include "secrets.h" 
 
 // ==========================================
-// 1. HARDWARE CONFIGURATION
+// 1. CONFIGURATION
 // ==========================================
-#define LOCK_PIN            16  // From OLED Code
-#define PIR_PIN             17  // From OLED Code
-#define STATUS_LED          2   // Built-in LED
+#define LOCK_PIN            16  
+#define PIR_PIN             17  
+#define STATUS_LED          2   
 #define AUTO_LOCK_TIMEOUT_MS 15000 
 
-// OLED Settings
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1 
-#define SCREEN_ADDRESS 0x3C 
-#define I2C_SDA 21          
-#define I2C_SCL 22          
-
-// ==========================================
-// 2. BLE CONFIGURATION
-// ==========================================
+// BLE
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHAR_ID_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8" 
 #define CHAR_NONCE_UUID     "d29a73d5-1234-4567-8901-23456789abcd" 
 #define CHAR_RESPONSE_UUID  "1c95d5e3-d8bc-4e31-9989-13e6184a44b9" 
 
-// Identity of THIS Lock
 const char* THIS_ROOM = "ROOM_404"; 
 
 // ==========================================
-// 3. USER DATABASE
+// 2. DATA STRUCTURES
 // ==========================================
 struct User {
     String id;
@@ -50,61 +42,36 @@ struct User {
     String allowedRoom; 
 };
 
-User userDatabase[] = {
-    // ID          Key            Role        Allowed Room
-    {"ADM_001",    "masterkey",   "ADMIN",    "ALL"},      
-    {"LEC_A",      "mathpass",    "LECTURER", "ROOM_303"}, 
-    {"LEC_B",      "englishpass", "LECTURER", "ROOM_404"}  
-};
-int userCount = sizeof(userDatabase) / sizeof(userDatabase[0]);
+std::vector<User> userDatabase; 
 
 // ==========================================
-// 4. GLOBAL OBJECTS
+// 3. GLOBAL OBJECTS
 // ==========================================
-// BLE Globals
 BLEServer* pServer = NULL;
-BLECharacteristic* pResponseChar = NULL; // Used for Hash AND Status updates
+BLECharacteristic* pResponseChar = NULL;
 bool deviceConnected = false;
 bool idVerified = false;
 int currentUserIndex = -1;
 
-// OLED & RTOS Globals
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 QueueHandle_t doorQueue;
 TimerHandle_t autoLockTimer; 
+Preferences preferences; 
 
 // ==========================================
-// 5. HELPER FUNCTIONS (Logic & Display)
+// 4. HELPER FUNCTIONS 
 // ==========================================
 
-void updateDisplay(String status) {
-  display.clearDisplay();
-  
-  // Room Name
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(20, 10); 
-  display.println(THIS_ROOM);
-
-  // Status
-  display.setTextSize(2);
-  display.setCursor(10, 40); 
-  display.println(status);
-  display.display(); 
-}
-
-// Convert bytes to Hex String
 String toHexString(uint8_t* data, size_t len) {
     String output = "";
-    char buff[3];
+    output.reserve(len * 2);
+    const char hexChars[] = "0123456789abcdef";
     for (size_t i = 0; i < len; i++) {
-        sprintf(buff, "%02x", data[i]);
-        output += buff;
+        output += hexChars[(data[i] >> 4) & 0xF];
+        output += hexChars[data[i] & 0xF];
     }
     return output;
 }
 
-// Calculate HMAC-SHA256
 void calculateHMAC(String nonce, String key, uint8_t* output) {
     mbedtls_md_context_t ctx;
     mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
@@ -116,72 +83,132 @@ void calculateHMAC(String nonce, String key, uint8_t* output) {
     mbedtls_md_free(&ctx);
 }
 
-// TRIGGER FUNCTION: Sends command to the Task (Non-blocking)
-void triggerDoorUnlock() {
-    int cmd = 1; // 1 = OPEN
-    xQueueSend(doorQueue, &cmd, 0);
+// ==========================================
+// 5. DATABASE & WIFI FUNCTIONS
+// ==========================================
+
+void parseUserData(String jsonString) {
+    JsonDocument doc; 
+    DeserializationError error = deserializeJson(doc, jsonString);
+
+    if (error) {
+        Serial.print(F("JSON Parsing Error: ")); 
+        Serial.println(error.f_str());
+        return;
+    }
+
+    userDatabase.clear(); 
+
+    JsonArray data = doc["data"];
+    for (JsonObject elem : data) {
+        User u;
+        if (elem.containsKey("username")) u.id = elem["username"].as<String>();
+        else if (elem.containsKey("userId")) u.id = elem["userId"].as<String>();
+        
+        if (elem.containsKey("key")) u.key = elem["key"].as<String>();
+        else if (elem.containsKey("secretKey")) u.key = elem["secretKey"].as<String>();
+        
+        if (elem.containsKey("allowed_room")) u.allowedRoom = elem["allowed_room"].as<String>();
+        else if (elem.containsKey("allowedRoom")) u.allowedRoom = elem["allowedRoom"].as<String>();
+
+        u.role = elem["role"].as<String>();
+        userDatabase.push_back(u);
+    }
+    Serial.print("User Database Updated. Total Users: "); 
+    Serial.println(userDatabase.size());
+}
+
+void syncDatabase() {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        Serial.print("Syncing DB from: "); 
+        Serial.println(API_URL);
+
+        http.begin(API_URL); 
+        int httpResponseCode = http.GET();
+
+        if (httpResponseCode > 0) {
+            String payload = http.getString();
+            Serial.print("HTTP Success. Payload Size: ");
+            Serial.println(payload.length());
+            
+            parseUserData(payload);
+            
+            preferences.begin("lock_db", false); 
+            preferences.putString("json_data", payload);
+            preferences.end();
+            Serial.println("Database Synced & Saved to Flash.");
+        } 
+        else {
+            Serial.print("HTTP Error: ");
+            Serial.println(httpResponseCode);
+            Serial.print("Error Details: ");
+            Serial.println(http.errorToString(httpResponseCode));
+        }
+        http.end();
+    } else {
+        Serial.println("Cannot Sync: WiFi Disconnected.");
+    }
+}
+
+void loadOfflineDatabase() {
+    Serial.println("Attempting to load Offline Database...");
+    preferences.begin("lock_db", true); 
+    String payload = preferences.getString("json_data", "");
+    preferences.end();
+
+    if (payload != "") {
+        Serial.println("Offline Data Found.");
+        parseUserData(payload);
+    } else {
+        Serial.println("No Offline Data Found in Flash.");
+    }
 }
 
 // ==========================================
-// 6. TASKS & TIMERS (The "Muscle")
+// 6. TASKS & TIMERS
 // ==========================================
 
-// Timer Callback: Runs when 15 seconds passes
 void autoLockCallback(TimerHandle_t xTimer) {
-  Serial.println("TIMER EXPIRED: Auto-locking...");
+  Serial.println("[TIMER] Auto-lock triggered.");
   int closeCommand = 0; 
   xQueueSend(doorQueue, &closeCommand, 0); 
 }
 
-// Main Door Task: Handles OLED, Relay, and PIR
 void doorTask(void * parameter) {
   int receivedCommand;
   bool isUnlocked = false; 
   unsigned long lastTimerReset = 0; 
 
-  updateDisplay("LOCKED"); // Initial State
+  Serial.println("[TASK] Door Task Started.");
 
   for(;;) { 
-    // Wait for command from BLE or Timer
     if (xQueueReceive(doorQueue, &receivedCommand, pdMS_TO_TICKS(100)) == pdTRUE) {
-      
-      // --- COMMAND: OPEN ---
       if (receivedCommand == 1) { 
-        Serial.println("TASK: Unlocking Hardware");
+        Serial.println("[DOOR] Unlocking...");
         digitalWrite(LOCK_PIN, HIGH);
         digitalWrite(STATUS_LED, HIGH);
         isUnlocked = true;
-        xTimerStart(autoLockTimer, 0); // Start Auto-lock
-        updateDisplay("UNLOCKED");
-        
-        // Notify App if connected
+        xTimerStart(autoLockTimer, 0); 
         if (deviceConnected && pResponseChar != NULL) {
-            pResponseChar->setValue("UNLOCKED");
             pResponseChar->notify();
         }
       }
-      // --- COMMAND: CLOSE ---
       else if (receivedCommand == 0) { 
-        Serial.println("TASK: Locking Hardware");
+        Serial.println("[DOOR] Locking...");
         digitalWrite(LOCK_PIN, LOW);
         digitalWrite(STATUS_LED, LOW);
         isUnlocked = false;
         xTimerStop(autoLockTimer, 0);
-        updateDisplay("LOCKED");
-        
-        // Notify App if connected
         if (deviceConnected && pResponseChar != NULL) {
-            pResponseChar->setValue("LOCKED");
             pResponseChar->notify();
         }
       }
     }
-
-    // --- PIR MOTION EXTENSION ---
-    // If door is unlocked AND motion detected -> Reset Timer
+    
     if (isUnlocked && digitalRead(PIR_PIN) == HIGH) {
       if (millis() - lastTimerReset > 1000) {
-        Serial.println("Motion Detected: Extending Unlock Timer");
+        Serial.println("[PIR] Motion Detected - Timer Extended.");
         xTimerReset(autoLockTimer, 0); 
         lastTimerReset = millis();
       }
@@ -190,19 +217,19 @@ void doorTask(void * parameter) {
 }
 
 // ==========================================
-// 7. BLE CALLBACKS (The "Brain")
+// 7. BLE CALLBACKS
 // ==========================================
 
 class ServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
       deviceConnected = true;
-      Serial.println("Device Connected");
+      Serial.println("[BLE] Device Connected.");
     };
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
       idVerified = false;
       currentUserIndex = -1;
-      Serial.println("Device Disconnected");
+      Serial.println("[BLE] Device Disconnected. Restarting Advertising...");
       BLEDevice::startAdvertising(); 
     }
 };
@@ -210,59 +237,49 @@ class ServerCallbacks: public BLEServerCallbacks {
 class IDCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
         String rxValue = pCharacteristic->getValue().c_str();
-
-        // CLEANUP
-        while (rxValue.length() > 0 && 
-              (rxValue[rxValue.length()-1] == 0 || 
-               rxValue[rxValue.length()-1] == '\n' || 
-               rxValue[rxValue.length()-1] == '\r' ||
-               rxValue[rxValue.length()-1] == ' ')) {
-            rxValue.remove(rxValue.length()-1);
-        }
+        rxValue.trim();
 
         if (rxValue.length() > 0) {
-            Serial.print("Rx ID: ["); Serial.print(rxValue); Serial.println("]");
+            Serial.print("[BLE] ID Rx: "); Serial.println(rxValue);
+            int cmd = 1; 
 
-            // --- COMMAND: OPEN ---
             if (rxValue == "OPEN") {
                 if (idVerified && currentUserIndex != -1) {
-                    String role = userDatabase[currentUserIndex].role;
-                    String targetRoom = userDatabase[currentUserIndex].allowedRoom;
-                    
-                    if (role == "ADMIN") {
-                        Serial.println("Access: GRANTED (Admin)");
-                        triggerDoorUnlock(); // Calls the Queue/Task
+                    User u = userDatabase[currentUserIndex];
+                    if (u.role == "ADMIN") {
+                        Serial.println("[ACCESS] Granted (Admin)");
+                        xQueueSend(doorQueue, &cmd, 0); 
                     } 
-                    else if (role == "LECTURER" && targetRoom == THIS_ROOM) {
-                        Serial.println("Access: GRANTED (Lecturer)");
-                        triggerDoorUnlock(); // Calls the Queue/Task
+                    else if (u.role == "LECTURER" && u.allowedRoom == THIS_ROOM) {
+                         Serial.println("[ACCESS] Granted (Lecturer)");
+                         xQueueSend(doorQueue, &cmd, 0); 
                     } 
                     else {
-                         Serial.println("Access: DENIED (Wrong Room)");
-                         // Notify App of specific failure
+                         Serial.println("[ACCESS] Denied (Wrong Room)");
                          pResponseChar->setValue("DENIED_ROOM");
                          pResponseChar->notify();
                     }
                 } else {
-                    Serial.println("Error: Not Authenticated.");
+                    Serial.println("[ACCESS] Denied (Not Verified)");
                 }
             }
-            // --- IDENTIFICATION: USER ID ---
             else {
+                // Identity Lookup
                 bool found = false;
-                for(int i=0; i < userCount; i++) {
+                for(int i=0; i < userDatabase.size(); i++) {
                     if (userDatabase[i].id == rxValue) {
                         currentUserIndex = i;
                         idVerified = true;
                         found = true;
-                        Serial.print("User Identified: "); Serial.println(userDatabase[i].id);
+                        Serial.print("[AUTH] User Found: "); 
+                        Serial.println(userDatabase[i].id);
                         break;
                     }
                 }
                 if(!found) {
                     idVerified = false;
                     currentUserIndex = -1;
-                    Serial.println("Unknown User ID.");
+                    Serial.println("[AUTH] Unknown User ID");
                 }
             }
         }
@@ -272,31 +289,22 @@ class IDCallbacks: public BLECharacteristicCallbacks {
 class NonceCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
         String nonce = pCharacteristic->getValue().c_str();
-
-        // CLEANUP
-        while (nonce.length() > 0 && 
-              (nonce[nonce.length()-1] == 0 || 
-               nonce[nonce.length()-1] == '\n' || 
-               nonce[nonce.length()-1] == '\r' ||
-               nonce[nonce.length()-1] == ' ')) {
-            nonce.remove(nonce.length()-1);
-        }
+        nonce.trim();
 
         if (nonce.length() > 0) {
-            Serial.print("Nonce: "); Serial.println(nonce);
-
-            if(idVerified && currentUserIndex != -1) {
+             Serial.print("[BLE] Nonce Rx: "); Serial.println(nonce);
+             
+             if (idVerified && currentUserIndex != -1) {
                 String userKey = userDatabase[currentUserIndex].key;
                 uint8_t hmacResult[32];
                 calculateHMAC(nonce, userKey, hmacResult);
                 String hexSignature = toHexString(hmacResult, 32);
                 
-                // Send Hash
                 pResponseChar->setValue(hexSignature.c_str());
                 pResponseChar->notify();
-                Serial.print("Sent Hash: "); Serial.println(hexSignature);
+                Serial.print("[BLE] Sent Hash: "); Serial.println(hexSignature);
             } else {
-                Serial.println("Ignored Nonce: User not verified.");
+                Serial.println("[BLE] Nonce Ignored: User not verified.");
             }
         }
     }
@@ -307,62 +315,66 @@ class NonceCallbacks: public BLECharacteristicCallbacks {
 // ==========================================
 void setup() {
   Serial.begin(115200);
+  Serial.println("\n\n--- ESP32 SMART LOCK STARTING ---");
   
-  // --- GPIO SETUP ---
   pinMode(LOCK_PIN, OUTPUT);
   pinMode(STATUS_LED, OUTPUT);
   pinMode(PIR_PIN, INPUT);
-  digitalWrite(LOCK_PIN, LOW); // Locked on boot
+  digitalWrite(LOCK_PIN, LOW); 
   digitalWrite(STATUS_LED, LOW);
 
-  // --- I2C / OLED SETUP ---
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(100000); 
-  delay(100);
-
-  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println(F("SSD1306 allocation failed. Check wiring."));
-    for(;;); 
+  // WiFi Setup
+  WiFi.begin(WIFI_SSID, WIFI_PASS); 
+  Serial.print("Connecting to WiFi");
+  
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 10) {
+      delay(500); // 500ms delay per dot
+      Serial.print(".");
+      retry++;
   }
-  display.clearDisplay();
-  display.display();
+  Serial.println("");
 
-  // --- RTOS SETUP ---
+  if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("WiFi Connected! IP: ");
+      Serial.println(WiFi.localIP());
+      syncDatabase(); 
+  } else {
+      Serial.println("WiFi Timeout. Switching to Offline Mode.");
+      loadOfflineDatabase(); 
+      delay(1000);
+  }
+
+  // RTOS Setup
   doorQueue = xQueueCreate(10, sizeof(int));
   autoLockTimer = xTimerCreate("AutoLock", pdMS_TO_TICKS(AUTO_LOCK_TIMEOUT_MS), pdFALSE, (void*)0, autoLockCallback);
-  // Start the Door Task on Core 1
   xTaskCreatePinnedToCore(doorTask, "DoorTask", 4096, NULL, 1, NULL, 1);
 
-  // --- BLE SETUP ---
-  BLEDevice::init("ESP32_Smart_Lock"); // Combined Name
+  // BLE Setup
+  BLEDevice::init("ESP32_Smart_Lock"); 
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // ID Characteristic
   BLECharacteristic *pIDChar = pService->createCharacteristic(CHAR_ID_UUID, BLECharacteristic::PROPERTY_WRITE);
   pIDChar->setCallbacks(new IDCallbacks());
 
-  // Nonce Characteristic
   BLECharacteristic *pNonceChar = pService->createCharacteristic(CHAR_NONCE_UUID, BLECharacteristic::PROPERTY_WRITE);
   pNonceChar->setCallbacks(new NonceCallbacks());
 
-  // Response Characteristic
   pResponseChar = pService->createCharacteristic(CHAR_RESPONSE_UUID, BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
   pResponseChar->addDescriptor(new BLE2902());
 
   pService->start();
   
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);  
+  BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
+  BLEDevice::getAdvertising()->setScanResponse(true);
+  BLEDevice::getAdvertising()->setMinPreferred(0x06);  
   BLEDevice::startAdvertising();
   
-  Serial.println("System Running: Secure OLED Lock");
+  Serial.println("System Running (Ready for BLE Connections)");
 }
 
 void loop() {
-  // Main loop is empty because FreeRTOS Task handles the door
   vTaskDelay(2000 / portTICK_PERIOD_MS);
 }
