@@ -7,6 +7,6 @@
 
 // --- API ENDPOINT ---
 // Use your computer's IP address if running locally (e.g., 192.168.1.X)
-#define API_URL "https://bfjbmjb2-5000.asse.devtunnels.ms/user" 
+#define API_URL "https://be-iot23-classroom-manager.vercel.app/user" 
 
 #endif

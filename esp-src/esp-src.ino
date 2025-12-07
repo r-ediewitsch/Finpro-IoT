@@ -10,22 +10,36 @@
 
 // --- NETWORK & STORAGE ---
 #include <WiFi.h>
+#include <WiFiClientSecure.h> // Required for HTTPS
 #include <HTTPClient.h>
 #include <ArduinoJson.h> 
 #include <Preferences.h>
 #include <vector>
-#include <PubSubClient.h> // MQTT Library
+#include <PubSubClient.h> 
 #include "secrets.h" 
+
+// --- DISPLAY LIBRARIES ---
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
 
 // ==========================================
 // 1. CONFIGURATION
 // ==========================================
+
+// --- DISPLAY SETTINGS ---
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES   4
+#define CLK_PIN       18 
+#define DATA_PIN      23 
+#define CS_PIN        5 
+
 // --- MQTT SETTINGS ---
 #define MQTT_BROKER         "broker.hivemq.com" 
 #define MQTT_PORT           1883
-#define MQTT_TOPIC_STATUS   "esp32/lock/status" // Topic 1: Real-time Status
-#define MQTT_TOPIC_LOG      "esp32/lock/log"    // Topic 2: Database Log (JSON)
-#define MQTT_TOPIC_SLEEP    "esp32/lock/sleep"  // Topic 3: Sleep Command (NEW)
+#define MQTT_TOPIC_STATUS   "esp32/lock/status" 
+#define MQTT_TOPIC_LOG      "esp32/lock/log"    
+#define MQTT_TOPIC_SLEEP    "esp32/lock/sleep"  
 
 // --- HARDWARE SETTINGS ---
 #define LOCK_PIN            16  
@@ -56,29 +70,42 @@ std::vector<User> userDatabase;
 // ==========================================
 // 3. GLOBAL OBJECTS
 // ==========================================
+// BLE
 BLEServer* pServer = NULL;
 BLECharacteristic* pResponseChar = NULL;
 bool deviceConnected = false;
 bool idVerified = false;
 int currentUserIndex = -1;
 
-// Tracks who performed the action (for Logging)
+// State
 String lastUnlockedBy = "SYSTEM"; 
-
-// --- NEW: Debounce Timer Variable ---
 unsigned long lastBleUnlockTime = 0; 
+unsigned long lastLockTime = 0;
 
+// RTOS Objects
 QueueHandle_t doorQueue;
+QueueHandle_t displayQueue; // Queue for display messages
 TimerHandle_t autoLockTimer; 
 Preferences preferences; 
 
-// MQTT Client
+// MQTT
 WiFiClient espClient;
 PubSubClient client(espClient);
+
+// Display
+MD_Parola P = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 
 // ==========================================
 // 4. HELPER FUNCTIONS 
 // ==========================================
+
+// Helper to send text to the display task safely
+void updateDisplay(const char* text) {
+    char buf[50];
+    strncpy(buf, text, sizeof(buf));
+    buf[sizeof(buf) - 1] = 0; // Ensure null termination
+    xQueueSend(displayQueue, &buf, 0);
+}
 
 String toHexString(uint8_t* data, size_t len) {
     String output = "";
@@ -106,14 +133,24 @@ void calculateHMAC(String nonce, String key, uint8_t* output) {
 // 5. DATABASE & WIFI FUNCTIONS
 // ==========================================
 
-void parseUserData(String jsonString) {
+bool parseUserData(String jsonString) {
+    // DEBUG: Print the raw payload to see what is causing the error
+    Serial.println("--- RAW PAYLOAD START ---");
+    Serial.println(jsonString);
+    Serial.println("--- RAW PAYLOAD END ---");
+
     JsonDocument doc; 
     DeserializationError error = deserializeJson(doc, jsonString);
 
     if (error) {
         Serial.print(F("JSON Parsing Error: ")); 
         Serial.println(error.f_str());
-        return;
+        return false; 
+    }
+
+    if (!doc.containsKey("data")) {
+        Serial.println("JSON Error: Key 'data' not found!");
+        return false;
     }
 
     userDatabase.clear(); 
@@ -135,36 +172,59 @@ void parseUserData(String jsonString) {
     }
     Serial.print("User Database Updated. Total Users: "); 
     Serial.println(userDatabase.size());
+    return true; 
 }
 
 void syncDatabase() {
     if (WiFi.status() == WL_CONNECTED) {
-        HTTPClient http;
-        Serial.print("Syncing DB from: "); 
-        Serial.println(API_URL);
+        WiFiClientSecure *secureClient = new WiFiClientSecure;
+        secureClient->setInsecure(); // IGNORE SSL CERTIFICATE ERRORS
 
-        http.begin(API_URL); 
+        HTTPClient http;
+        
+        #ifdef API_URL
+            Serial.print("Syncing DB from: "); Serial.println(API_URL);
+            http.begin(*secureClient, API_URL); 
+        #else
+            Serial.println("API_URL not defined!");
+            delete secureClient;
+            return;
+        #endif
+
+        // FOLLOW REDIRECTS AUTOMATICALLY
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
         int httpResponseCode = http.GET();
 
         if (httpResponseCode > 0) {
             String payload = http.getString();
+            
             Serial.print("HTTP Success. Payload Size: ");
             Serial.println(payload.length());
-            
-            parseUserData(payload);
-            
-            preferences.begin("lock_db", false); 
-            preferences.putString("json_data", payload);
-            preferences.end();
-            Serial.println("Database Synced & Saved to Flash.");
-        } 
-        else {
-            Serial.print("HTTP Error: ");
+
+            if (httpResponseCode == 200) {
+                 bool parseSuccess = parseUserData(payload);
+                 if (parseSuccess) {
+                    preferences.begin("lock_db", false); 
+                    preferences.putString("json_data", payload);
+                    preferences.end();
+                    Serial.println("Database Synced & Saved to Flash.");
+                 } else {
+                    Serial.println("Sync Failed: Invalid JSON Data.");
+                 }
+            } else {
+                 Serial.print("Server returned non-200 code: ");
+                 Serial.println(httpResponseCode);
+            }
+        } else {
+            Serial.print("HTTP Request Failed. Error Code: "); 
             Serial.println(httpResponseCode);
-            Serial.print("Error Details: ");
+            Serial.print("Error Detail: ");
             Serial.println(http.errorToString(httpResponseCode));
         }
+        
         http.end();
+        delete secureClient;
     } else {
         Serial.println("Cannot Sync: WiFi Disconnected.");
     }
@@ -185,31 +245,49 @@ void loadOfflineDatabase() {
 }
 
 // --- MQTT HELPER FUNCTIONS ---
-
-// 1. Sends "LOCKED" or "UNLOCKED" (For UI Status)
 void publishLiveStatus(String state) {
     if (!client.connected()) return;
     client.publish(MQTT_TOPIC_STATUS, state.c_str());
 }
 
-// 2. Sends Full JSON (For Database/Logs)
 void publishAccessLog(String user, String room) {
     if (!client.connected()) return;
-    
     JsonDocument doc;
     doc["userId"] = user;
     doc["room"]   = room;
-    // Node-RED will add timestamp
-    
     char buffer[200];
     serializeJson(doc, buffer);
-
     client.publish(MQTT_TOPIC_LOG, buffer);
 }
 
 // ==========================================
 // 6. TASKS & TIMERS
 // ==========================================
+
+// --- DISPLAY TASK ---
+void displayTask(void * parameter) {
+    char currentMessage[50] = "";
+    char newMessage[50];
+    
+    // Initialize Parola
+    P.begin();
+    // Default startup message
+    strcpy(currentMessage, THIS_ROOM);
+    P.displayText(currentMessage, PA_CENTER, 40, 0, PA_SCROLL_LEFT, PA_SCROLL_LEFT);
+
+    for(;;) {
+        // Animation routine - must be called frequently
+        if (P.displayAnimate()) {
+            // Animation loop finished, check if we have a new message waiting in the queue
+            if (xQueueReceive(displayQueue, &newMessage, 0) == pdTRUE) {
+                strcpy(currentMessage, newMessage);
+                P.displayReset(); // Reset display to show new text
+            }
+        }
+        // Very short delay to prevent watchdog starvation, but keep animation smooth
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
 
 void autoLockCallback(TimerHandle_t xTimer) {
   Serial.println("[TIMER] Auto-lock triggered.");
@@ -229,34 +307,47 @@ void doorTask(void * parameter) {
       if (receivedCommand == 1) { 
         // --- UNLOCK EVENT ---
         Serial.println("[DOOR] Unlocking...");
-        digitalWrite(LOCK_PIN, HIGH);
+        digitalWrite(LOCK_PIN, LOW);
         digitalWrite(STATUS_LED, HIGH);
         isUnlocked = true;
         xTimerStart(autoLockTimer, 0); 
+        
+        // Notify BLE
         if (deviceConnected && pResponseChar != NULL) {
             pResponseChar->notify();
         }
         
-        // MQTT ACTIONS
+        // Update Display
+        char welcomeMsg[50];
+        snprintf(welcomeMsg, sizeof(welcomeMsg), "Welcome %s", lastUnlockedBy.c_str());
+        updateDisplay(welcomeMsg);
+
+        // MQTT
         publishLiveStatus("UNLOCKED");
         publishAccessLog(lastUnlockedBy, THIS_ROOM);
       }
       else if (receivedCommand == 0) { 
         // --- LOCK EVENT ---
         Serial.println("[DOOR] Locking...");
-        digitalWrite(LOCK_PIN, LOW);
+        digitalWrite(LOCK_PIN, HIGH);
         digitalWrite(STATUS_LED, LOW);
         isUnlocked = false;
+        lastLockTime = millis(); 
         xTimerStop(autoLockTimer, 0);
+        
         if (deviceConnected && pResponseChar != NULL) {
             pResponseChar->notify();
         }
-        
-        // MQTT ACTIONS
+
+        // Update Display
+        updateDisplay("LOCKED");
+
+        // MQTT
         publishLiveStatus("LOCKED");
       }
     }
     
+    // PIR Logic
     if (isUnlocked && digitalRead(PIR_PIN) == HIGH) {
       if (millis() - lastTimerReset > 1000) {
         Serial.println("[PIR] Motion Detected - Timer Extended.");
@@ -280,7 +371,7 @@ class ServerCallbacks: public BLEServerCallbacks {
       deviceConnected = false;
       idVerified = false;
       currentUserIndex = -1;
-      lastUnlockedBy = "SYSTEM"; // Reset
+      lastUnlockedBy = "SYSTEM"; 
       Serial.println("[BLE] Device Disconnected. Restarting Advertising...");
       BLEDevice::startAdvertising(); 
     }
@@ -293,23 +384,19 @@ class IDCallbacks: public BLECharacteristicCallbacks {
 
         if (rxValue.length() > 0) {
             int cmd = 1; 
-
             if (rxValue == "OPEN") {
-                // --- NEW: DEBOUNCE LOGIC ---
-                // We check if it has been at least 2000ms (2 seconds) since the last unlock
+                // Debounce check
                 unsigned long now = millis();
-                if (now - lastBleUnlockTime < 2000) {
-                    Serial.println("[BLE] OPEN command ignored (spam protection)");
-                    return; // Stop here, do not process
+                if ((now - lastBleUnlockTime < 2000) || (now - lastLockTime < 2000)) { 
+                  Serial.println("[BLE] OPEN command ignored (spam/cool-down protection)");
+                  return;
                 }
 
                 Serial.print("[BLE] ID Rx: "); Serial.println(rxValue);
-                lastBleUnlockTime = now; // Update the timestamp
+                lastBleUnlockTime = now; 
 
                 if (idVerified && currentUserIndex != -1) {
                     User u = userDatabase[currentUserIndex];
-                    
-                    // SAVE USER FOR LOGGING
                     lastUnlockedBy = u.id;
 
                     if (u.role == "ADMIN") {
@@ -324,13 +411,15 @@ class IDCallbacks: public BLECharacteristicCallbacks {
                          Serial.println("[ACCESS] Denied (Wrong Room)");
                          pResponseChar->setValue("DENIED_ROOM");
                          pResponseChar->notify();
+                         updateDisplay("ACCESS DENIED"); 
                     }
                 } else {
                     Serial.println("[ACCESS] Denied (Not Verified)");
+                    updateDisplay("ACCESS DENIED"); 
                 }
             }
             else {
-                // Identity Lookup (We don't debounce this as finding ID is fast and passive)
+                // Identity Lookup
                 Serial.print("[BLE] ID Rx: "); Serial.println(rxValue);
                 bool found = false;
                 for(int i=0; i < userDatabase.size(); i++) {
@@ -357,11 +446,9 @@ class NonceCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
         String nonce = pCharacteristic->getValue().c_str();
         nonce.trim();
-
         if (nonce.length() > 0) {
-             Serial.print("[BLE] Nonce Rx: "); Serial.println(nonce);
-             
-             if (idVerified && currentUserIndex != -1) {
+            Serial.print("[BLE] Nonce Rx: "); Serial.println(nonce);
+            if (idVerified && currentUserIndex != -1) {
                 String userKey = userDatabase[currentUserIndex].key;
                 uint8_t hmacResult[32];
                 calculateHMAC(nonce, userKey, hmacResult);
@@ -381,12 +468,9 @@ class NonceCallbacks: public BLECharacteristicCallbacks {
 // 8. SETUP & LOOP
 // ==========================================
 
-// --- MQTT CALLBACK FUNCTION ---
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String message = "";
-  for (int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
+  for (int i = 0; i < length; i++) message += (char)payload[i];
 
   Serial.print("MQTT Message arrived [");
   Serial.print(topic);
@@ -395,10 +479,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (String(topic) == MQTT_TOPIC_SLEEP && message == "SLEEP") {
       Serial.println("[SYSTEM] Sleep command received.");
-      
+      updateDisplay("SLEEPING...");
       client.publish(MQTT_TOPIC_SLEEP, "SLEEPING_NOW", true); 
       delay(500); 
-
+      
       Serial.println("[SYSTEM] Entering Deep Sleep for 12 Hours...");
       esp_sleep_enable_timer_wakeup(12ULL * 60 * 60 * 1000000);
       esp_deep_sleep_start();
@@ -407,12 +491,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 void reconnectMQTT() {
   while (!client.connected()) {
-    String clientId = "ESP32Client-";
-    clientId += String(random(0xffff), HEX);
+    String clientId = "ESP32-" + String(random(0xffff), HEX);
     if (client.connect(clientId.c_str())) {
       Serial.println("[MQTT] Connected");
       client.subscribe(MQTT_TOPIC_SLEEP);
-      String currentStatus = (digitalRead(LOCK_PIN) == HIGH) ? "UNLOCKED" : "LOCKED";
+      String currentStatus = (digitalRead(LOCK_PIN) == LOW) ? "UNLOCKED" : "LOCKED";
       publishLiveStatus(currentStatus);
     } else {
       delay(2000);
@@ -423,25 +506,35 @@ void reconnectMQTT() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\n--- ESP32 SMART LOCK STARTING ---");
-  
+
+  // Hardware Init
   pinMode(LOCK_PIN, OUTPUT);
   pinMode(STATUS_LED, OUTPUT);
-  pinMode(PIR_PIN, INPUT);
-  digitalWrite(LOCK_PIN, LOW); 
+  pinMode(PIR_PIN, INPUT); 
+  digitalWrite(LOCK_PIN, HIGH);
   digitalWrite(STATUS_LED, LOW);
+
+  // RTOS Init
+  doorQueue = xQueueCreate(10, sizeof(int));
+  displayQueue = xQueueCreate(5, 50); 
+  autoLockTimer = xTimerCreate("AutoLock", pdMS_TO_TICKS(AUTO_LOCK_TIMEOUT_MS), pdFALSE, (void*)0, autoLockCallback);
+  
+  // Create Tasks
+  xTaskCreatePinnedToCore(doorTask, "DoorTask", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(displayTask, "DisplayTask", 4096, NULL, 1, NULL, 1); 
 
   // WiFi Setup
   WiFi.begin(WIFI_SSID, WIFI_PASS); 
   Serial.print("Connecting to WiFi");
-  
+
   int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 10) {
-      delay(500); // 500ms delay per dot
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+      delay(1000); 
       Serial.print(".");
       retry++;
   }
   Serial.println("");
-
+  
   if (WiFi.status() == WL_CONNECTED) {
       Serial.print("WiFi Connected! IP: ");
       Serial.println(WiFi.localIP());
@@ -452,14 +545,9 @@ void setup() {
       delay(1000);
   }
 
-  // MQTT INIT
+  // MQTT
   client.setServer(MQTT_BROKER, MQTT_PORT);
   client.setCallback(mqttCallback);
-
-  // RTOS Setup
-  doorQueue = xQueueCreate(10, sizeof(int));
-  autoLockTimer = xTimerCreate("AutoLock", pdMS_TO_TICKS(AUTO_LOCK_TIMEOUT_MS), pdFALSE, (void*)0, autoLockCallback);
-  xTaskCreatePinnedToCore(doorTask, "DoorTask", 4096, NULL, 1, NULL, 1);
 
   // BLE Setup
   BLEDevice::init("ESP32_Smart_Lock"); 
@@ -477,12 +565,10 @@ void setup() {
   pResponseChar->addDescriptor(new BLE2902());
 
   pService->start();
-  
   BLEDevice::getAdvertising()->addServiceUUID(SERVICE_UUID);
   BLEDevice::getAdvertising()->setScanResponse(true);
-  BLEDevice::getAdvertising()->setMinPreferred(0x06);  
   BLEDevice::startAdvertising();
-  
+
   Serial.println("System Running (Ready for BLE Connections)");
 }
 
@@ -493,5 +579,5 @@ void loop() {
       }
       client.loop();
   }
-  vTaskDelay(100 / portTICK_PERIOD_MS);
+  vTaskDelay(50 / portTICK_PERIOD_MS); 
 }
